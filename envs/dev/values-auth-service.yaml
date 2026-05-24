@@ -44,16 +44,16 @@ readinessProbe:
   successThreshold: 1
 configmap:
   SPRING_PROFILES_ACTIVE: dev
-  DB_HOST: pharma-dev-postgres.cyrywaguk6v4.us-east-1.rds.amazonaws.com
+  DB_HOST:  "pharma-dev-postgres.cupgoqko4dpc.us-east-1.rds.amazonaws.com"
   LOG_LEVEL: DEBUG
   SERVER_PORT: "8081"
   TOKEN_EXPIRATION_MS: "86400000"
   MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,info,metrics,prometheus"
 envFrom:
   - secretRef:
-      name: db-credentials
+      name: db-credential-secret
   - secretRef:
-      name: jwt-secret
+      name: jwt-secret-key
 volumeMounts:
   - name: tmp
     mountPath: /tmp
