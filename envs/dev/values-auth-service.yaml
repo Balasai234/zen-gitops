@@ -51,9 +51,9 @@ configmap:
   MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE: "health,info,metrics,prometheus"
 envFrom:
   - secretRef:
-      name: db-credentials
+      name: db-credential-secret
   - secretRef:
-      name: jwt-secret
+      name: jwt-secret-key
 volumeMounts:
   - name: tmp
     mountPath: /tmp
