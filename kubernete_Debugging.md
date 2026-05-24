@@ -237,7 +237,7 @@ ArgoCD successfully synced ConfigMap changes.
 
 However, Kubernetes does NOT automatically restart pods when:
 
-ConfigMaps change
+ConfigMaps changef
 Secrets change
 
 Pods load environment variables only during startup.
