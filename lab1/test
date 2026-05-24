@@ -1,0 +1,618 @@
+/* RL2062 Data Entry Rule: Tenants - Create Magnum child tickets for T0 and for tenants on the CPS
+
+Creates the appropriate magnum child tickets for new T0 tenant enrollments and for tenants on the CPS. The key difference is that now ONLY the T0 tenant from the TIEF requires a child magnum ticket  creation. All tenants referenced by the CPS will also require a child magnum ticket creation, but only if they are not a new T0 tenant.
+
+Create 1 child magnum ticket  for each T0 required to be built on the TIEF. Always use msdyn_tasksubtype = "Tenant 0 Creation" for these tasks.
+
+Also create 1 child magnum ticket  for each tenant on the CPS. If the new T0 is also listed on the CPS, then only 1 child magnum ticket  will be created for that T0. For all other tenants on the CPS, create 1 child magnum ticket  for each tenant.
+ - Only create child magnum tickets  for OLS Future Pricing when there is a lead enrollment number on the CPS. Use the logic to look up existing tenant enrollments under this lead enrollment.
+ - When a tenant is referenced in the PO Line Items, it will always lead to a child magnum ticket. If the tenant referenced in the PO Line Items is also a new T0, then it will share the ticket created for the T0 creation. All others will lead to a child magnum ticket. 
+
+Ouput:
+Table(
+    {
+        ava_name: [Tenant name, either from the TIEF for new tenants or from the tenant Enrollment lookup when referenced on the CPS],
+        ava_primarycontactemailaddress: [always set to "@", as the email address is not known at this time],
+        ava_previousenrollmentnumber: Blank()
+    }
+)
+
+*/
+With(
+    {
+        /* Level 1: Extract document data */
+        TiefTenants: LookUp(
+            LookUp(
+                CaseDocuments.Documents,
+                Lower(Trim(Data.DocumentName)) = Lower(Trim("Tenant Information Excel Form (TIEF)"))
+            ).Data.Tables,
+            Lower(Trim(Section)) = Lower(Trim("Tenants"))
+        ).Rows,
+        QuoteNumber: Coalesce(
+            Trim(
+                LookUp(
+                    LookUp(
+                        CaseDocuments.Documents,
+                        Lower(Trim(Coalesce(Data.DocumentName, ""))) = Lower(Trim("CPS"))
+                    ).Data.Fields,
+                    Lower(Trim(Coalesce(FieldName, ""))) = Lower(Trim("Quote Number"))
+                ).FieldValue
+            ),
+            ""
+        ),
+        EnrNumber: Coalesce(
+            Trim(
+                LookUp(
+                    LookUp(
+                        CaseDocuments.Documents,
+                        Lower(Trim(Coalesce(Data.DocumentName, ""))) = Lower(Trim("CPS"))
+                    ).Data.Fields,
+                    Lower(Trim(Coalesce(FieldName, ""))) = Lower(Trim("Enrollment Number"))
+                ).FieldValue
+            ),
+            ""
+        ),
+        hasM130Form: !IsBlankOrError(
+            LookUp(
+                CaseDocuments.Documents,
+                Lower(Trim(Data.DocumentName)) = Lower(Trim("amendment m130"))
+            )
+        ),
+        hasEnterpriseEnrollment: !IsBlankOrError(
+            LookUp(
+                CaseDocuments.Documents,
+                Lower(Trim(Data.DocumentName)) = Lower(Trim("enterprise enrollment"))
+            )
+        )
+    },
+    With(
+        {
+            /* Level 2: Call primary functions */
+            AgrDetails: If(
+                IsBlank(EnrNumber),
+                Blank(),
+                IfError(GetAgreement(EnrNumber), Blank())
+            ),
+            QuoteDetails: If(
+                IsBlank(QuoteNumber),
+                Blank(),
+                IfError(GetMSQuote(QuoteNumber), Blank())
+            )
+        },
+        With(
+            {
+                /* Level 3: Derive key values, build T0 tasks from TIEF, extract CPS tenants */
+                IsLeadEnrollment: Lower(Trim(Coalesce(AgrDetails.ContractTypeName, ""))) in [Lower(Trim("Lead Enrollment")), Lower(Trim("GIA EA"))],
+                QuoteSpecialPricingRaw: If(
+                    IsBlank(QuoteNumber),
+                    Blank(),
+                    IfError(GetMSQuoteSpecialPricings(QuoteNumber), Blank())
+                ),
+                CpsTenantsRaw: If(
+                    IsBlankOrError(QuoteDetails) Or IsBlankOrError(QuoteDetails.PurchaseOrderLineItems.PurchaseOrderLineItem),
+                    Blank(),
+                    ForAll(
+                        Filter(
+                            QuoteDetails.PurchaseOrderLineItems.PurchaseOrderLineItem,
+                            !IsBlankOrError(Trim(Coalesce(TenantName, "")))
+                        ),
+                        With(
+                            {
+                                _TenantName: Trim(Coalesce(ThisRecord.TenantName, ""))
+                            },
+                            {
+                                TenantNameOriginal: _TenantName,
+                                TenantNameNormalized: Lower(_TenantName)
+                            }
+                        )
+                    )
+                ),
+                /* Build T0 tasks: only first tenant per amendment group gets a task,
+                   unless M130 + M130 form + Enterprise Enrollment (then none are T0) */
+                T0Tasks: If(
+                    IsBlankOrError(TiefTenants),
+                    Blank(),
+                    DropColumns(
+                        Filter(
+                            ForAll(
+                                Sequence(CountRows(TiefTenants)),
+                                With(
+                                    {
+                                        ThisTenant: Last(FirstN(TiefTenants, Value))
+                                    },
+                                    With(
+                                        {
+                                            ThisAmendment: Coalesce(
+                                                Trim(
+                                                    LookUp(
+                                                        ThisTenant.Fields,
+                                                        Lower(Trim(FieldName)) = Lower(Trim("Amendment"))
+                                                    ).FieldValue
+                                                ),
+                                                ""
+                                            )
+                                        },
+                                        With(
+                                            {
+                                                /* Find any earlier tenant with the same amendment to determine first-per-group */
+                                                EarlierSameAmendment: LookUp(
+                                                    Sequence(If(Value > 1, Value - 1, 0)),
+                                                    With(
+                                                        {
+                                                            OtherTenant: Last(FirstN(TiefTenants, Value))
+                                                        },
+                                                        Lower(
+                                                            Coalesce(
+                                                                Trim(
+                                                                    LookUp(
+                                                                        OtherTenant.Fields,
+                                                                        Lower(Trim(FieldName)) = Lower(Trim("Amendment"))
+                                                                    ).FieldValue
+                                                                ),
+                                                                ""
+                                                            )
+                                                        ) = Lower(Trim(ThisAmendment))
+                                                    )
+                                                )
+                                            },
+                                            {
+                                                /* Include only T0: first per amendment AND not the M130+form+EE exception */
+                                                _include: IsBlank(EarlierSameAmendment) And
+                                                    Not(
+                                                        Lower(Trim(ThisAmendment)) = Lower(Trim("m130"))
+                                                        And hasM130Form
+                                                        And hasEnterpriseEnrollment
+                                                    ),
+                                                msdyn_tasktype: "Tenant Task",
+                                                msdyn_tasksubtype: "Tenant 0 Creation",
+                                                msdyn_name: Coalesce(
+                                                    Trim(
+                                                        LookUp(
+                                                            ThisTenant.Fields,
+                                                            Lower(Trim(FieldName)) = Lower(Trim("Tenant Affiliate Entity Name"))
+                                                        ).FieldValue
+                                                    ),
+                                                    ""
+                                                ),
+                                                msdyn_enrollmentnumber: "",
+                                                msdyn_priorenrollmentnumber: Coalesce(
+                                                    Trim(
+                                                        LookUp(
+                                                            ThisTenant.Fields,
+                                                            Lower(Trim(FieldName)) = Lower(Trim("Prior Tenant Enrollment Number"))
+                                                        ).FieldValue
+                                                    ),
+                                                    ""
+                                                ),
+                                                msdyn_amendment: ThisAmendment,
+                                                msdyn_cloudscope: Coalesce(
+                                                    Trim(
+                                                        LookUp(
+                                                            ThisTenant.Fields,
+                                                            Lower(Trim(FieldName)) = Lower(Trim("Cloudscope"))
+                                                        ).FieldValue
+                                                    ),
+                                                    ""
+                                                )
+                                            }
+                                        )
+                                    )
+                                )
+                            ),
+                            _include
+                        ),
+                        _include
+                    )
+                )
+            },
+            With(
+                {
+                    /* Level 4: Extract T0 names for CPS exclusion, retrieve child agreements */
+                    T0NamesNormalized: If(
+                        IsBlankOrError(T0Tasks),
+                        Blank(),
+                        ForAll(
+                            T0Tasks,
+                            Lower(Trim(Coalesce(msdyn_name, "")))
+                        )
+                    ),
+                    ChildAgreementsRaw: If(
+                        !IsLeadEnrollment Or IsBlankOrError(AgrDetails) Or IsBlank(Coalesce(Trim(AgrDetails.MainAgreementNumber), "")),
+                        Blank(),
+                        IfError(
+                            Filter(
+                                GetAgreementsByMainAgreementNumber(AgrDetails.MainAgreementNumber, Blank(), Blank(), Blank()),
+                                Lower(Trim(Coalesce(AgreementStatusName, ""))) = Lower(Trim("Active"))
+                            ),
+                            Blank()
+                        )
+                    )
+                },
+                With(
+                    {
+                        /* Level 5: Build child agreement candidates with M130/ADDTEN check, determine OLS eligibility */
+                        CandidateChildAgreements: If(
+                            IsBlankOrError(ChildAgreementsRaw) Or IsBlank(Coalesce(Trim(EnrNumber), "")),
+                            Blank(),
+                            ForAll(
+                                Filter(
+                                    ChildAgreementsRaw,
+                                    !IsBlankOrError(Trim(Coalesce(PrimaryCustomer, ""))) And
+                                    IfError(
+                                        Find(
+                                            Lower(Trim(Coalesce(EnrNumber, ""))),
+                                            Lower(Trim(Coalesce(PrimaryCustomer, "")))
+                                        ),
+                                        0
+                                    ) > 0
+                                ),
+                                With(
+                                    {
+                                        _AgreementNumber: Coalesce(Trim(ThisRecord.AgreementNumber), ""),
+                                        _PrimaryCustomer: Coalesce(Trim(ThisRecord.PrimaryCustomer), ""),
+                                        _CandidateAmendments: If(
+                                            IsBlank(Coalesce(Trim(ThisRecord.AgreementNumber), "")),
+                                            Blank(),
+                                            IfError(GetAgreementAmendments(Trim(ThisRecord.AgreementNumber)), Blank())
+                                        )
+                                    },
+                                    {
+                                        AgreementNumber: _AgreementNumber,
+                                        PrimaryCustomer: _PrimaryCustomer,
+                                        isM130Tenant: If(
+                                            IsBlankOrError(_CandidateAmendments),
+                                            false,
+                                            CountRows(
+                                                Filter(
+                                                    _CandidateAmendments,
+                                                    StartsWith(Lower(Trim(Coalesce(AmendmentNumber, ""))), "m130") Or
+                                                    StartsWith(Lower(Trim(Coalesce(AmendmentNumber, ""))), "addten")
+                                                )
+                                            ) > 0
+                                        )
+                                    }
+                                )
+                            )
+                        ),
+                        HasOlsSpecialPricing: If(
+                            IsBlankOrError(QuoteSpecialPricingRaw),
+                            false,
+                            CountRows(
+                                Filter(
+                                    ForAll(
+                                        QuoteSpecialPricingRaw,
+                                        With(
+                                            {
+                                                _YearAppliedTo: IfError(Value(ThisRecord.YearAppliedTo), 0),
+                                                _PartNumber: Trim(Coalesce(ThisRecord.PartNumber, ""))
+                                            },
+                                            With(
+                                                {
+                                                    _IsOls: IfError(
+                                                        If(
+                                                            _YearAppliedTo = 0,
+                                                            If(
+                                                                StartsWith(
+                                                                    Lower(Trim(Coalesce(GetItem(_PartNumber).ProductGroupingName, ""))),
+                                                                    Lower(Trim("Online Subscription"))
+                                                                ),
+                                                                true,
+                                                                false
+                                                            ),
+                                                            false
+                                                        ),
+                                                        false
+                                                    )
+                                                },
+                                                {
+                                                    YearAppliedTo: _YearAppliedTo,
+                                                    IsOls: _IsOls
+                                                }
+                                            )
+                                        )
+                                    ),
+                                    YearAppliedTo = 0 And IsOls
+                                )
+                            ) > 0
+                        )
+                    },
+                    With(
+                        {
+                            /* Level 6: Build distinct CPS tenants with enrollment lookup, and agreement-derived tenants */
+                            DistinctCpsTenants: If(
+                                IsBlankOrError(CpsTenantsRaw),
+                                Blank(),
+                                ForAll(
+                                    Distinct(CpsTenantsRaw, TenantNameNormalized),
+                                    With(
+                                        {
+                                            _TenantNameNormalized: Coalesce(Trim(ThisRecord.Value), "")
+                                        },
+                                        With(
+                                            {
+                                                _TenantSource: First(
+                                                    Filter(
+                                                        CpsTenantsRaw,
+                                                        Lower(Trim(Coalesce(TenantNameNormalized, ""))) = Lower(Trim(Coalesce(_TenantNameNormalized, "")))
+                                                    )
+                                                ),
+                                                _MatchedAgreement: If(
+                                                    IsBlankOrError(CandidateChildAgreements) Or IsBlank(Coalesce(Trim(_TenantNameNormalized), "")),
+                                                    Blank(),
+                                                    LookUp(
+                                                        CandidateChildAgreements,
+                                                        !IsBlankOrError(Trim(Coalesce(PrimaryCustomer, ""))) And
+                                                        IfError(
+                                                            Find(
+                                                                Lower(Trim(Coalesce(_TenantNameNormalized, ""))),
+                                                                Lower(Trim(Coalesce(PrimaryCustomer, "")))
+                                                            ),
+                                                            0
+                                                        ) > 0
+                                                    )
+                                                )
+                                            },
+                                            {
+                                                TenantName: Coalesce(Trim(_TenantSource.TenantNameOriginal), ""),
+                                                TenantNameNormalized: _TenantNameNormalized,
+                                                AgreementNumber: If(
+                                                    IsBlankOrError(_MatchedAgreement),
+                                                    "",
+                                                    Coalesce(Trim(_MatchedAgreement.AgreementNumber), "")
+                                                ),
+                                                isM130Tenant: If(
+                                                    IsBlankOrError(_MatchedAgreement),
+                                                    false,
+                                                    _MatchedAgreement.isM130Tenant
+                                                )
+                                            }
+                                        )
+                                    )
+                                )
+                            ),
+                            AgreementDerivedTenantCandidates: If(
+                                IsLeadEnrollment And HasOlsSpecialPricing And !IsBlankOrError(CandidateChildAgreements),
+                                Filter(
+                                    ForAll(
+                                        CandidateChildAgreements,
+                                        With(
+                                            {
+                                                _AgreementNumber: Coalesce(Trim(ThisRecord.AgreementNumber), ""),
+                                                _PrimaryCustomer: Coalesce(Trim(ThisRecord.PrimaryCustomer), ""),
+                                                _LeadEnrollmentNumber: Coalesce(Trim(EnrNumber), ""),
+                                                _IsM130Tenant: ThisRecord.isM130Tenant
+                                            },
+                                            With(
+                                                {
+                                                    _TenantNameBase: Trim(
+                                                        If(
+                                                            IsBlankOrError(_PrimaryCustomer) Or IsBlank(_LeadEnrollmentNumber),
+                                                            "",
+                                                            IfError(
+                                                                Mid(
+                                                                    _PrimaryCustomer,
+                                                                    Find(_LeadEnrollmentNumber, _PrimaryCustomer) + Len(_LeadEnrollmentNumber),
+                                                                    Len(_PrimaryCustomer)
+                                                                ),
+                                                                ""
+                                                            )
+                                                        )
+                                                    )
+                                                },
+                                                With(
+                                                    {
+                                                        /* Remove leading hyphen from tenant name portion */
+                                                        _TenantName: Trim(
+                                                            If(
+                                                                StartsWith(_TenantNameBase, "-"),
+                                                                Mid(_TenantNameBase, 2, Len(_TenantNameBase)),
+                                                                _TenantNameBase
+                                                            )
+                                                        )
+                                                    },
+                                                    {
+                                                        TenantName: _TenantName,
+                                                        TenantNameNormalized: Lower(_TenantName),
+                                                        AgreementNumber: _AgreementNumber,
+                                                        PrimaryCustomer: _PrimaryCustomer,
+                                                        isM130Tenant: _IsM130Tenant
+                                                    }
+                                                )
+                                            )
+                                        )
+                                    ),
+                                    !IsBlankOrError(Trim(Coalesce(TenantName, ""))) And
+                                    !IsBlankOrError(Trim(Coalesce(AgreementNumber, ""))) And
+                                    !IsBlankOrError(Trim(Coalesce(PrimaryCustomer, "")))
+                                ),
+                                Blank()
+                            )
+                        },
+                        With(
+                            {
+                                /* Level 7: Combine CPS and agreement-derived tenants into a single candidate set */
+                                CombinedTenantCandidates: If(
+                                    IfError(CountRows(DistinctCpsTenants), 0) + IfError(CountRows(AgreementDerivedTenantCandidates), 0) = 0,
+                                    Blank(),
+                                    ForAll(
+                                        Sequence(
+                                            IfError(CountRows(DistinctCpsTenants), 0) + IfError(CountRows(AgreementDerivedTenantCandidates), 0)
+                                        ),
+                                        If(
+                                            Value <= IfError(CountRows(DistinctCpsTenants), 0),
+                                            With(
+                                                {
+                                                    _CpsRow: Index(DistinctCpsTenants, Value)
+                                                },
+                                                {
+                                                    TenantName: Coalesce(Trim(_CpsRow.TenantName), ""),
+                                                    TenantNameNormalized: Coalesce(Trim(_CpsRow.TenantNameNormalized), ""),
+                                                    AgreementNumber: Coalesce(Trim(_CpsRow.AgreementNumber), ""),
+                                                    isM130Tenant: _CpsRow.isM130Tenant
+                                                }
+                                            ),
+                                            With(
+                                                {
+                                                    _AgreementRow: Index(
+                                                        AgreementDerivedTenantCandidates,
+                                                        Value - IfError(CountRows(DistinctCpsTenants), 0)
+                                                    )
+                                                },
+                                                {
+                                                    TenantName: Coalesce(Trim(_AgreementRow.TenantName), ""),
+                                                    TenantNameNormalized: Coalesce(Trim(_AgreementRow.TenantNameNormalized), ""),
+                                                    AgreementNumber: Coalesce(Trim(_AgreementRow.AgreementNumber), ""),
+                                                    isM130Tenant: _AgreementRow.isM130Tenant
+                                                }
+                                            )
+                                        )
+                                    )
+                                )
+                            },
+                            With(
+                                {
+                                    /* Level 8: De-duplicate combined CPS tenants by normalized name */
+                                    DistinctCombinedNames: If(
+                                        IsBlankOrError(CombinedTenantCandidates),
+                                        Blank(),
+                                        Distinct(CombinedTenantCandidates, TenantNameNormalized)
+                                    )
+                                },
+                                With(
+                                    {
+                                        /* Level 9: Build CPS task candidate rows (materialized before filtering) */
+                                        _RawCpsTasks: 
+                                            ForAll(
+                                                DistinctCombinedNames,
+                                                With(
+                                                    {
+                                                        _TenantNameNormalized: Coalesce(Trim(ThisRecord.Value), "")
+                                                    },
+                                                    With(
+                                                        {
+                                                            _CandidateWithAgreement: First(
+                                                                Filter(
+                                                                    CombinedTenantCandidates,
+                                                                    Lower(Trim(Coalesce(TenantNameNormalized, ""))) = Lower(Trim(Coalesce(_TenantNameNormalized, ""))) And
+                                                                    !IsBlank(Coalesce(Trim(AgreementNumber), ""))
+                                                                )
+                                                            ),
+                                                            _FallbackCandidate: First(
+                                                                Filter(
+                                                                    CombinedTenantCandidates,
+                                                                    Lower(Trim(Coalesce(TenantNameNormalized, ""))) = Lower(Trim(Coalesce(_TenantNameNormalized, "")))
+                                                                )
+                                                            ),
+                                                            _IsT0Tenant: If(
+                                                                IsBlankOrError(T0NamesNormalized),
+                                                                false,
+                                                                IfError(
+                                                                    !IsBlank(
+                                                                        LookUp(
+                                                                            T0NamesNormalized,
+                                                                            Lower(Trim(Coalesce(Value, ""))) = Lower(Trim(Coalesce(_TenantNameNormalized, "")))
+                                                                        )
+                                                                    ),
+                                                                    false
+                                                                )
+                                                            )
+                                                        },
+                                                        With(
+                                                            {
+                                                                _ResolvedCandidate: If(
+                                                                    !IsBlankOrError(_CandidateWithAgreement) And !IsBlank(Coalesce(Trim(_CandidateWithAgreement.TenantName), "")),
+                                                                    _CandidateWithAgreement,
+                                                                    _FallbackCandidate
+                                                                )
+                                                            },
+                                                            With(
+                                                                {
+                                                                    _ResolvedTenantName: IfError(Coalesce(Trim(_ResolvedCandidate.TenantName), ""), ""),
+                                                                    _ResolvedAgreementNumber: IfError(Coalesce(Trim(_ResolvedCandidate.AgreementNumber), ""), ""),
+                                                                    _ResolvedIsM130Tenant: IfError(Coalesce(_ResolvedCandidate.isM130Tenant, false), false)
+                                                                },
+                                                                With(
+                                                                    {
+                                                                        _HasTenantName: !IsBlank(Coalesce(Trim(_TenantNameNormalized), "")),
+                                                                        _HasResolvedTenantName: !IsBlank(_ResolvedTenantName),
+                                                                        _LeadOlsAmendmentGate: If(
+                                                                            IsLeadEnrollment And HasOlsSpecialPricing,
+                                                                            _ResolvedIsM130Tenant,
+                                                                            true
+                                                                        )
+                                                                    },
+                                                                    {
+                                                                        _include: IfError(
+                                                                            _HasTenantName And
+                                                                            _HasResolvedTenantName And
+                                                                            Not(_IsT0Tenant) And
+                                                                            _LeadOlsAmendmentGate,
+                                                                            false
+                                                                        ),
+                                                                        msdyn_tasktype: "Tenant Task",
+                                                                        msdyn_tasksubtype: "Existing Tenant Update",
+                                                                        msdyn_name: _ResolvedTenantName,
+                                                                        msdyn_enrollmentnumber: _ResolvedAgreementNumber,
+                                                                        msdyn_priorenrollmentnumber: "",
+                                                                        msdyn_amendment: "",
+                                                                        msdyn_cloudscope: ""
+                                                                    }
+                                                                )
+                                                            )
+                                                        )
+                                                    )
+                                                )
+                                            )
+                                        
+                                    },
+                                    With(
+                                        {
+                                            /* Level 10: Filter materialized CPS tasks to exclude non-included rows */
+                                            CpsFinalTasks: If(
+                                                IsBlankOrError(_RawCpsTasks),
+                                                Blank(),
+                                                DropColumns(
+                                                    Filter(_RawCpsTasks, _include),
+                                                    _include
+                                                )
+                                            )
+                                        },
+                                        /* Final output: Combine T0 tasks and CPS tasks into a single table */
+                                        ForAll(
+                                            Sequence(
+                                                IfError(CountRows(T0Tasks), 0) + IfError(CountRows(CpsFinalTasks), 0)
+                                            ),
+                                            If(
+                                                Value <= IfError(CountRows(T0Tasks), 0),
+                                                With(
+                                                    {
+                                                        _T0Row: Index(T0Tasks, Value)
+                                                    },
+                                                    {
+                                                        ava_name: Coalesce(_T0Row.msdyn_name, ""),
+                                                        ava_primarycontactemailaddress: "@",
+                                                        ava_previousenrollmentnumber: Blank()
+                                                    }
+                                                ),
+                                                With(
+                                                    {
+                                                        _CpsRow: Index(CpsFinalTasks, Value - IfError(CountRows(T0Tasks), 0))
+                                                    },
+                                                    {
+                                                        ava_name: Coalesce(_CpsRow.msdyn_name, ""),
+                                                        ava_primarycontactemailaddress: "@",
+                                                        ava_previousenrollmentnumber: Blank()
+                                                    }
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+    )
+)

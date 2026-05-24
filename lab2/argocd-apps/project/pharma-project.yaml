@@ -8,7 +8,7 @@ spec:
 
   sourceRepos:
     # Replace <YOUR_GITHUB_USERNAME> with your GitHub username after forking zen-gitops
-    - "https://github.com/DPP-2026/zen-gitops.git"
+    - "https://github.com/Balasai234/zen-gitops"
 
   destinations:
     - server: https://kubernetes.default.svc
