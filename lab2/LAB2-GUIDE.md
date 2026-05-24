@@ -33,7 +33,7 @@ Every student needs their own copy of zen-gitops so ArgoCD can watch **your** re
 
 **1a. Fork on GitHub**
 
-1. Go to `https://github.com/DPP-2026/zen-gitops`
+1. Go to `https://github.com/Balasai234/zen-gitops`
 2. Click **Fork** → create under your GitHub account
 3. Clone your fork locally:
 
